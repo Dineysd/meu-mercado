@@ -1398,6 +1398,35 @@
   </div>
 </div>
 
+<div class="modal-overlay" id="modal-nfce-debug">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">🔍 Debug — Resposta do Servidor</div>
+    <p id="debug-summary" style="font-size:0.85rem;color:var(--text-soft);margin:0 0 8px;white-space:pre-wrap;"></p>
+    <pre id="debug-content" style="
+      font-size:0.72rem;
+      background:var(--bg-card);
+      border:1px solid var(--border);
+      border-radius:8px;
+      padding:10px;
+      max-height:52dvh;
+      overflow:auto;
+      white-space:pre-wrap;
+      word-break:break-all;
+      color:var(--text-main);
+      margin:0 0 12px;
+    "></pre>
+    <button class="btn btn-secondary btn-full" onclick="
+      navigator.clipboard?.writeText(document.getElementById('debug-content').textContent)
+        .then(() => showToast('Copiado!', 'success'))
+        .catch(() => showToast('Selecione e copie manualmente.', ''));
+    ">📋 Copiar</button>
+    <div style="height:8px;"></div>
+    <button class="btn btn-primary btn-full" onclick="closeModal('modal-nfce-debug')">OK</button>
+    <div style="height:8px;"></div>
+  </div>
+</div>
+
 <script>
 // ════════════════════════════════════════════════════════════════════
 // MEU MERCADO v2.0 — JavaScript Principal
@@ -2508,6 +2537,26 @@ async function importNFCeFromURL() {
   await fetchAndImportNFCe(url, store);
 }
 
+function showNFCeDebug(html, url) {
+  const lines = html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?(td|tr|div|p|span|li|h\d)[^>]*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .split('\n')
+    .map(l => l.replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim())
+    .filter(l => l)
+    .slice(0, 60)
+    .join('\n');
+
+  document.getElementById('debug-summary').textContent =
+    `URL: ${url}\nTamanho: ${html.length} bytes`;
+  document.getElementById('debug-content').textContent =
+    '=== TEXTO EXTRAÍDO (primeiras 60 linhas) ===\n' + lines +
+    '\n\n=== HTML RAW (primeiros 2000 chars) ===\n' + html.slice(0, 2000);
+
+  openModal('modal-nfce-debug');
+}
+
 async function fetchAndImportNFCe(url, storeName = '') {
   try {
     // Verificar duplicata pela URL do QR Code
@@ -2538,7 +2587,7 @@ async function fetchAndImportNFCe(url, storeName = '') {
     const parsed = parseNFCeHTML(html);
 
     if (!parsed.items.length) {
-      showToast('Não foi possível extrair itens da nota fiscal.', 'error');
+      showNFCeDebug(html, url);
       return;
     }
 
