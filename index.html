@@ -2611,6 +2611,57 @@ function parseNFCeHTML(html) {
     });
   }
 
+  // ESTRATÉGIA 4: regex no texto — formato PR moderno (fazenda.pr.gov.br/nfce/qrc)
+  // Detecta padrão "Qtde.:X UN: Kg Vl. Unit.: X" presente na página do PR
+  if (!items.length) {
+    const lines = html
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/?(td|tr|div|p|span|li|h\d)[^>]*>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .split('\n')
+      .map(l => l.replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim())
+      .filter(l => l);
+
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/Qtde\.:([0-9,]+)\s+UN:\s*([A-Za-z]+)\s+Vl\.\s*Unit\.:\s*([0-9,.]+)/);
+      if (!m) continue;
+
+      const qty = parseFloat(m[1].replace(',', '.'));
+      const unit = m[2];
+      const unitPrice = parseFloat(m[3].replace(',', '.'));
+
+      // Nome nas linhas anteriores (ignora rótulos de interface)
+      let name = '';
+      for (let j = i - 1; j >= Math.max(0, i - 5); j--) {
+        const candidate = lines[j].replace(/\(Código:\s*\d+\)/g, '').trim();
+        if (candidate.length > 2 && !/^(Vl\.|Qtde\.|UN:|Filtrar|Imprimir|NFC|DOCUMENTO|Código|Total)/i.test(candidate)) {
+          name = candidate;
+          break;
+        }
+      }
+
+      // Total nas linhas seguintes (número isolado como "7,93")
+      let totalPrice = parseFloat((qty * unitPrice).toFixed(2));
+      for (let j = i + 1; j <= Math.min(lines.length - 1, i + 4); j++) {
+        if (/^[\d]+[,.][\d]{2}$/.test(lines[j])) {
+          totalPrice = parseFloat(lines[j].replace(',', '.'));
+          break;
+        }
+      }
+
+      if (name && qty > 0 && unitPrice > 0) {
+        items.push({
+          name: cleanProductName(name),
+          qty,
+          unit: unit.toLowerCase() === 'kg' ? 'kg' : (detectUnit(unit) || 'un'),
+          unitPrice,
+          totalPrice,
+          category: guessCategory(name),
+        });
+      }
+    }
+  }
+
   // Total — múltiplos seletores
   const totalEl = doc.querySelector(
     '.totalNota, .valorTotal, .vTotTrib, #u60, [id*="total"], [class*="total"]'
