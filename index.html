@@ -2660,8 +2660,7 @@ function parseNFCeHTML(html) {
     });
   }
 
-  // ESTRATÉGIA 4: regex no texto — formato PR moderno (fazenda.pr.gov.br/nfce/qrc)
-  // Detecta padrão "Qtde.:X UN: Kg Vl. Unit.: X" presente na página do PR
+  // ESTRATÉGIA 4: PR moderno — cada campo em linha separada (fazenda.pr.gov.br/nfce/qrc)
   if (!items.length) {
     const lines = html
       .replace(/<br\s*\/?>/gi, '\n')
@@ -2672,28 +2671,30 @@ function parseNFCeHTML(html) {
       .filter(l => l);
 
     for (let i = 0; i < lines.length; i++) {
-      const m = lines[i].match(/Qtde\.:([0-9,]+)\s+UN:\s*([A-Za-z]+)\s+Vl\.\s*Unit\.:\s*([0-9,.]+)/);
-      if (!m) continue;
+      const qtdeMatch = lines[i].match(/^Qtde\.:([0-9,]+)$/);
+      if (!qtdeMatch) continue;
 
-      const qty = parseFloat(m[1].replace(',', '.'));
-      const unit = m[2];
-      const unitPrice = parseFloat(m[3].replace(',', '.'));
+      const qty = parseFloat(qtdeMatch[1].replace(',', '.'));
+      const unitMatch = (lines[i + 1] || '').match(/^UN:\s*([A-Za-z]+)/);
+      const unit = unitMatch ? unitMatch[1] : 'un';
+      const unitPriceMatch = (lines[i + 2] || '').match(/Vl\.\s*Unit\.:\s*([0-9,.]+)/);
+      if (!unitPriceMatch) continue;
+      const unitPrice = parseFloat(unitPriceMatch[1].replace(',', '.'));
 
-      // Nome nas linhas anteriores (ignora rótulos de interface)
-      let name = '';
-      for (let j = i - 1; j >= Math.max(0, i - 5); j--) {
-        const candidate = lines[j].replace(/\(Código:\s*\d+\)/g, '').trim();
-        if (candidate.length > 2 && !/^(Vl\.|Qtde\.|UN:|Filtrar|Imprimir|NFC|DOCUMENTO|Código|Total)/i.test(candidate)) {
-          name = candidate;
-          break;
-        }
+      // linha i+3 = "Vl. Total" (rótulo), linha i+4 = valor total
+      let totalPrice = parseFloat((qty * unitPrice).toFixed(2));
+      const totalLine = lines[i + 4] || '';
+      if (/^[0-9]+[,.][0-9]{1,2}$/.test(totalLine)) {
+        totalPrice = parseFloat(totalLine.replace(',', '.'));
       }
 
-      // Total nas linhas seguintes (número isolado como "7,93")
-      let totalPrice = parseFloat((qty * unitPrice).toFixed(2));
-      for (let j = i + 1; j <= Math.min(lines.length - 1, i + 4); j++) {
-        if (/^[\d]+[,.][\d]{2}$/.test(lines[j])) {
-          totalPrice = parseFloat(lines[j].replace(',', '.'));
+      // Nome: busca backward ignorando "(Código: ...)"
+      let name = '';
+      for (let j = i - 1; j >= Math.max(0, i - 4); j--) {
+        const c = lines[j];
+        if (/^\(Código:/i.test(c)) continue;
+        if (c.length > 2 && !/^(Vl\.|Qtde\.|UN:|Filtrar|Imprimir|NFC|DOCUMENTO)/i.test(c)) {
+          name = c;
           break;
         }
       }
