@@ -2384,12 +2384,6 @@ async function openQRScanner() {
     return;
   }
 
-  if (typeof jsQR === 'undefined') {
-    showToast('Biblioteca QR Code não carregada. Use a entrada manual.', 'error');
-    manualNFCeEntry();
-    return;
-  }
-
   const overlay = document.getElementById('qr-overlay');
   overlay.classList.add('open');
 
@@ -2423,22 +2417,42 @@ async function openQRScanner() {
 
 function scanQRFrame() {
   const video = document.getElementById('qr-video');
-  const canvas = document.getElementById('qr-canvas');
-  const ctx = canvas.getContext('2d');
 
   if (video.readyState !== video.HAVE_ENOUGH_DATA) {
     qrAnimFrame = requestAnimationFrame(scanQRFrame);
     return;
   }
 
+  // Método 1: BarcodeDetector nativo (Chrome Android/Desktop, Edge — sem CDN)
+  if (typeof BarcodeDetector !== 'undefined') {
+    if (!window._qrDetector) {
+      window._qrDetector = new BarcodeDetector({ formats: ['qr_code'] });
+    }
+    window._qrDetector.detect(video).then(codes => {
+      if (!qrStream) return;
+      if (codes.length > 0) {
+        document.getElementById('qr-status').textContent = '✅ QR Code detectado!';
+        stopQRScanner();
+        processQRCode(codes[0].rawValue);
+      } else {
+        qrAnimFrame = requestAnimationFrame(scanQRFrame);
+      }
+    }).catch(() => {
+      qrAnimFrame = requestAnimationFrame(scanQRFrame);
+    });
+    return;
+  }
+
+  // Método 2: jsQR via canvas (fallback para Firefox/Safari)
+  const canvas = document.getElementById('qr-canvas');
+  const ctx = canvas.getContext('2d');
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const code = jsQR(imageData.data, imageData.width, imageData.height, {
-    inversionAttempts: 'attemptBoth',
-  });
+  const code = typeof jsQR !== 'undefined'
+    ? jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'attemptBoth' })
+    : null;
 
   if (code) {
     document.getElementById('qr-status').textContent = '✅ QR Code detectado!';
@@ -2454,6 +2468,7 @@ function stopQRScanner() {
   if (qrAnimFrame) cancelAnimationFrame(qrAnimFrame);
   if (qrScanTimeout) { clearTimeout(qrScanTimeout); qrScanTimeout = null; }
   if (qrStream) { qrStream.getTracks().forEach(t => t.stop()); qrStream = null; }
+  window._qrDetector = null;
   document.getElementById('qr-overlay').classList.remove('open');
   document.getElementById('qr-status').textContent = 'Aponte para o QR Code do cupom fiscal';
 }
@@ -2495,9 +2510,24 @@ async function importNFCeFromURL() {
 
 async function fetchAndImportNFCe(url, storeName = '') {
   try {
+    // Verificar duplicata pela URL do QR Code
+    const allTrips = await dbGetAll('trips');
+    const duplicate = allTrips.find(t => t.nfceUrl === url);
+    if (duplicate) {
+      showToast(`Esta nota já foi importada em ${fmtDate(duplicate.date)}.`, 'warning');
+      return;
+    }
+
     // Chamar o proxy da Netlify Function
     const proxyUrl = `/api/nfce-proxy?url=${encodeURIComponent(url)}`;
-    const resp = await fetch(proxyUrl, { timeout: 12000 });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    let resp;
+    try {
+      resp = await fetch(proxyUrl, { signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({ error: 'Erro desconhecido' }));
@@ -2512,7 +2542,7 @@ async function fetchAndImportNFCe(url, storeName = '') {
       return;
     }
 
-    pendingImport = { items: parsed.items, store: storeName || parsed.store, date: parsed.date, total: parsed.total, discount: parsed.discount };
+    pendingImport = { items: parsed.items, store: storeName || parsed.store, date: parsed.date, total: parsed.total, discount: parsed.discount, nfceUrl: url };
     showImportPreview(pendingImport);
 
   } catch (err) {
@@ -2531,51 +2561,83 @@ function parseNFCeHTML(html) {
   let total = 0;
   let discount = 0;
 
-  // Tentar extrair nome do estabelecimento (PR)
-  const storeEl = doc.querySelector('.txtTopo, .NomeRazaoSocial, h4, .razaoSocial, .nomeEmpresa');
+  // Nome da loja — múltiplos seletores (PR, SP, MG, SC, RS, RJ...)
+  const storeEl = doc.querySelector(
+    '.txtTopo, .NomeRazaoSocial, .razaoSocial, .nomeEmpresa, #u20, .empresa, h4, .cabecalho h2, .cabecalho h3'
+  );
   if (storeEl) store = storeEl.textContent.trim().split('\n')[0].trim();
 
-  // Tentar extrair data
-  const dateEl = doc.querySelector('.txtCabeçalho, .DataHoraEmissao, .dataEmissao');
-  if (dateEl) {
-    const m = dateEl.textContent.match(/(\d{2})\/(\d{2})\/(\d{4})/);
-    if (m) date = `${m[3]}-${m[2]}-${m[1]}`;
-  }
+  // Data — múltiplos seletores; também busca por regex em todo o documento como fallback
+  const dateEl = doc.querySelector(
+    '.txtCabeçalho, .DataHoraEmissao, .dataEmissao, #u30, [id*="data"], [class*="data"]'
+  );
+  const dateText = dateEl ? dateEl.textContent : doc.body.textContent;
+  const dm = dateText.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+  if (dm) date = `${dm[3]}-${dm[2]}-${dm[1]}`;
 
-  // Tentar extrair itens - formato PR
-  const rows = doc.querySelectorAll('table tr, .item, .itemNF, tr.linhaShade, tr.linhaShadeAlt');
-  rows.forEach(row => {
+  // ESTRATÉGIA 1: linhas com classe específica de nota fiscal (PR, SC, RS)
+  const classRows = doc.querySelectorAll('tr.linhaShade, tr.linhaShadeAlt, tr.odd, tr.even');
+  classRows.forEach(row => {
     const cells = row.querySelectorAll('td');
-    if (cells.length >= 4) {
-      const name = cells[1]?.textContent.trim() || cells[0]?.textContent.trim();
+    if (cells.length >= 3) {
+      const name = (cells[1] || cells[0])?.textContent.trim();
       const qtyStr = cells[2]?.textContent.trim() || '1';
-      const priceStr = cells[4]?.textContent.trim() || cells[3]?.textContent.trim() || '0';
-
-      if (name && name.length > 2 && !name.toLowerCase().includes('produto')) {
-        const qty = parseFloat(qtyStr.replace(',', '.')) || 1;
-        const price = parseFloat(priceStr.replace(/[R$\s]/g, '').replace(',', '.')) || 0;
-        if (price > 0) {
-          items.push({
-            name: cleanProductName(name),
-            qty,
-            unit: detectUnit(qtyStr) || 'un',
-            unitPrice: price / qty,
-            totalPrice: price,
-            category: guessCategory(name),
-          });
-        }
-      }
+      const priceStr = (cells[4] || cells[3])?.textContent.trim() || '0';
+      _tryAddItem(items, name, qtyStr, priceStr);
     }
   });
 
-  // Tentar extrair total e desconto
-  const totalEl = doc.querySelector('.totalNota, .valorTotal, .vTotTrib, [class*="total"]');
+  // ESTRATÉGIA 2: divs/spans com classe "item" (SP, MG, RJ...)
+  if (!items.length) {
+    doc.querySelectorAll('.item, .itemNF, .produto').forEach(el => {
+      const name = el.querySelector('.nome, .descricao, [class*="nome"], [class*="desc"]')?.textContent.trim()
+                || el.querySelector('span:first-child, b:first-child')?.textContent.trim();
+      const qtyStr = el.querySelector('.qtd, .quantidade, [class*="qtd"]')?.textContent.trim() || '1';
+      const priceStr = el.querySelector('.valor, .preco, [class*="valor"], [class*="preco"]')?.textContent.trim() || '0';
+      _tryAddItem(items, name, qtyStr, priceStr);
+    });
+  }
+
+  // ESTRATÉGIA 3: qualquer tabela com 4+ colunas (genérico)
+  if (!items.length) {
+    doc.querySelectorAll('table tr').forEach(row => {
+      const cells = row.querySelectorAll('td');
+      if (cells.length >= 4) {
+        const name = cells[1]?.textContent.trim() || cells[0]?.textContent.trim();
+        const qtyStr = cells[2]?.textContent.trim() || '1';
+        const priceStr = cells[4]?.textContent.trim() || cells[3]?.textContent.trim() || '0';
+        _tryAddItem(items, name, qtyStr, priceStr);
+      }
+    });
+  }
+
+  // Total — múltiplos seletores
+  const totalEl = doc.querySelector(
+    '.totalNota, .valorTotal, .vTotTrib, #u60, [id*="total"], [class*="total"]'
+  );
   if (totalEl) {
     const m = totalEl.textContent.match(/[\d.,]+/);
-    if (m) total = parseFloat(m[0].replace(',', '.'));
+    if (m) total = parseFloat(m[0].replace(/\./g, '').replace(',', '.'));
   }
 
   return { items, store, date, total, discount };
+}
+
+function _tryAddItem(items, name, qtyStr, priceStr) {
+  if (!name || name.length < 2) return;
+  if (/^(produto|descrição|item|código|qtd|valor|total|un\.?med)/i.test(name.trim())) return;
+  const qty = parseFloat((qtyStr || '1').replace(',', '.')) || 1;
+  const price = parseFloat((priceStr || '0').replace(/[R$\s.]/g, '').replace(',', '.')) || 0;
+  if (price > 0) {
+    items.push({
+      name: cleanProductName(name),
+      qty,
+      unit: detectUnit(qtyStr) || 'un',
+      unitPrice: price / qty,
+      totalPrice: price,
+      category: guessCategory(name),
+    });
+  }
 }
 
 function cleanProductName(name) {
@@ -2632,7 +2694,7 @@ function showImportPreview(data) {
 
 async function confirmImport() {
   if (!pendingImport) return;
-  const { items, store, date, total, discount } = pendingImport;
+  const { items, store, date, total, discount, nfceUrl } = pendingImport;
 
   const calculatedTotal = total || items.reduce((s, i) => s + i.totalPrice, 0);
 
@@ -2642,6 +2704,7 @@ async function confirmImport() {
     date: date || todayStr(),
     createdAt: new Date().toISOString(),
     finishedAt: new Date().toISOString(),
+    nfceUrl: nfceUrl || null,
     total: calculatedTotal - (discount || 0),
     discount: discount || 0,
     itemsCount: items.length,
