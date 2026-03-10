@@ -1534,6 +1534,7 @@ let catalogFilter = 'all';
 let deferredPrompt = null;
 let qrStream = null;
 let qrAnimFrame = null;
+let qrScanTimeout = null;
 let pendingImport = null;
 
 // ─── INDEXEDDB ────────────────────────────────────────────────────
@@ -2383,8 +2384,21 @@ async function openQRScanner() {
     return;
   }
 
+  if (typeof jsQR === 'undefined') {
+    showToast('Biblioteca QR Code não carregada. Use a entrada manual.', 'error');
+    manualNFCeEntry();
+    return;
+  }
+
   const overlay = document.getElementById('qr-overlay');
   overlay.classList.add('open');
+
+  qrScanTimeout = setTimeout(() => {
+    if (qrStream) {
+      showToast('Não foi possível ler o QR Code. Tente a entrada manual.', 'warning');
+      manualNFCeEntry();
+    }
+  }, 30000);
 
   try {
     qrStream = await navigator.mediaDevices.getUserMedia({
@@ -2392,9 +2406,15 @@ async function openQRScanner() {
     });
     const video = document.getElementById('qr-video');
     video.srcObject = qrStream;
-    video.play();
-    video.onloadedmetadata = () => scanQRFrame();
+    await video.play();
+    if (video.readyState >= video.HAVE_METADATA) {
+      scanQRFrame();
+    } else {
+      video.onloadedmetadata = () => scanQRFrame();
+    }
   } catch (err) {
+    clearTimeout(qrScanTimeout);
+    qrScanTimeout = null;
     stopQRScanner();
     showToast('Não foi possível acessar a câmera. Verifique as permissões.', 'error');
     setTimeout(() => manualNFCeEntry(), 500);
@@ -2416,9 +2436,9 @@ function scanQRFrame() {
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const code = typeof jsQR !== 'undefined' ? jsQR(imageData.data, imageData.width, imageData.height, {
-    inversionAttempts: 'dontInvert',
-  }) : null;
+  const code = jsQR(imageData.data, imageData.width, imageData.height, {
+    inversionAttempts: 'attemptBoth',
+  });
 
   if (code) {
     document.getElementById('qr-status').textContent = '✅ QR Code detectado!';
@@ -2432,6 +2452,7 @@ function scanQRFrame() {
 
 function stopQRScanner() {
   if (qrAnimFrame) cancelAnimationFrame(qrAnimFrame);
+  if (qrScanTimeout) { clearTimeout(qrScanTimeout); qrScanTimeout = null; }
   if (qrStream) { qrStream.getTracks().forEach(t => t.stop()); qrStream = null; }
   document.getElementById('qr-overlay').classList.remove('open');
   document.getElementById('qr-status').textContent = 'Aponte para o QR Code do cupom fiscal';
